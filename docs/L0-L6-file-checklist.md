@@ -46,6 +46,9 @@
 > 为什么不给完整代码：给了你就会"抄"，抄完大脑没有任何痕迹。
 > 给骨架不给肉，你晚上要自己长肉，这才是有效练习。
 
+另外，每个阶段末尾还配了一张 **🔁 代码流程骨架**：按**运行时调用链**写清"入口 → 关键调用 → 终点"，并列出"顺序不能换"的地方。
+默想时的正确顺序是：**先过一遍流程骨架（谁调谁），再看文件清单（每个类写什么）**——先有链路，再填零件。
+
 ---
 
 ## 一、看任何一个文件，固定问四句话
@@ -817,6 +820,85 @@ curl.exe -i -X OPTIONS http://localhost:8123/api/health/ `
 
 ---
 
+### 🔁 L0 代码流程骨架
+
+**① 启动流程**
+
+```text
+main()
+ → SpringApplication.run(MyCodeMotherApplication.class)
+ → 扫描 com.yupi.yuaicodemother 及子包
+ → 注册 Controller / @RestControllerAdvice / @Configuration
+ → 创建内嵌 Tomcat：端口 8123，context-path = /api
+```
+
+**② 成功请求**
+
+```text
+GET /api/health/
+ → Tomcat 剥掉 /api
+ → DispatcherServlet
+ → HandlerMapping 匹配 HealthController#healthCheck
+ → healthCheck() → ResultUtils.success("ok")
+ → HttpMessageConverter → Jackson
+ → 200 {"code":0,"data":"ok","message":"ok"}
+```
+
+**③ 异常请求**
+
+```text
+Controller 内 throw BusinessException
+ → 方法栈展开，return 不执行
+ → DispatcherServlet.doDispatch 捕获，交给 processHandlerException
+ → ExceptionHandlerExceptionResolver 按"继承距离"选 handler
+ → GlobalExceptionHandler.businessExceptionHandler
+ → ResultUtils.error(e.getCode(), e.getMessage())
+ → 200 {"code":40000,"data":null,"message":"请求参数错误"}
+```
+
+**④ 骨架代码（三个接口点）**
+
+```java
+@SpringBootApplication
+public class MyCodeMotherApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(MyCodeMotherApplication.class, args);
+    }
+}
+
+@RestController
+@RequestMapping("/health")
+public class HealthController {
+    @GetMapping({"", "/"})
+    public BaseResponse<String> healthCheck() {
+        return ResultUtils.success("ok");
+    }
+}
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    @ExceptionHandler(BusinessException.class)
+    public BaseResponse<?> businessExceptionHandler(BusinessException e) {
+        log.warn("业务异常 code={}, msg={}", e.getCode(), e.getMessage());
+        return ResultUtils.error(e.getCode(), e.getMessage());
+    }
+
+    @ExceptionHandler(RuntimeException.class)
+    public BaseResponse<?> runtimeExceptionHandler(RuntimeException e) {
+        log.error("未预期异常", e);
+        return ResultUtils.error(ErrorCode.SYSTEM_ERROR, "系统错误");
+    }
+}
+```
+
+**⑤ 顺序锁**
+
+1. 启动类必须在**根包**，否则 Controller 扫不到（启动成功但全 404）。
+2. 异常处理器必须挂在 `@RestControllerAdvice` Bean 上，普通 `@Component` 不生效。
+3. 业务异常分支靠"类型距离 0"胜出，**不靠方法书写顺序**。
+
+---
+
 
 # L1 · 用户体系（12 个文件）
 
@@ -969,6 +1051,103 @@ public interface UserService extends IService<User> {
 
 **⑥ 验收一句话**：注册 → 登录 → 带 cookie 调 `/get/login` 能拿到用户，且响应里**绝对没有** `password` / `salt` 字段。
 
+### 🔁 L1 代码流程骨架
+
+**① 注册**
+
+```text
+POST /api/user/register
+ → UserController.userRegister(@RequestBody UserRegisterRequest dto)
+ → dto == null ? PARAMS_ERROR
+ → UserService.userRegister(account, password, checkPassword)
+     1 校验：长度、两次密码一致、账号字符
+     2 查重：selectOne(userAccount)
+     3 加盐摘要：MD5(SALT + password)
+     4 组装：User（账号 / 密文 / 默认 USER 角色）
+     5 save
+ → ResultUtils.success(id)
+```
+
+**② 登录**
+
+```text
+POST /api/user/login
+ → UserService.userLogin(account, password, request)
+     1 校验入参
+     2 加密：MD5(SALT + password)
+     3 按 account + 密文查库
+     4 null → PARAMS_ERROR("用户不存在或密码错误")
+     5 session.setAttribute(USER_LOGIN_STATE, user)
+     6 return getLoginUserVO(user)        // 脱敏
+```
+
+**③ 取当前用户（全项目调用最多）**
+
+```text
+GET /api/user/get/login
+ → UserService.getLoginUser(request)
+     1 session.getAttribute(USER_LOGIN_STATE)
+     2 null → NOT_LOGIN_ERROR
+     3 取 id → getById(id)
+     4 null → NOT_LOGIN_ERROR
+     5 return user
+```
+
+**④ 权限切面**
+
+```text
+任意带 @AuthCheck 的方法
+ → AuthInterceptor.preHandle(...)
+     1 handler instanceof HandlerMethod ?
+     2 方法或类上找 @AuthCheck
+     3 没有注解 → return true
+     4 有注解 → getLoginUser(request)
+     5 mustRole 非空 && 用户角色不匹配 → 抛 NO_AUTH_ERROR
+     6 return true
+```
+
+**⑤ 骨架代码**
+
+```java
+public interface UserService {
+    long userRegister(String userAccount, String userPassword, String checkPassword);
+    LoginUserVO userLogin(String userAccount, String userPassword, HttpServletRequest request);
+    User getLoginUser(HttpServletRequest request);
+    boolean userLogout(HttpServletRequest request);
+    LoginUserVO getLoginUserVO(User user);
+}
+```
+
+```java
+// UserServiceImpl 的四个方法只留"步骤注释"，晚上自己填肉
+public long userRegister(String account, String pwd, String checkPwd) {
+    // 1 校验 2 查重 3 加盐摘要 4 组装 5 save
+    return 0L;
+}
+
+public LoginUserVO userLogin(String account, String pwd, HttpServletRequest request) {
+    // 1 校验 2 加密 3 查库 4 判空 5 写 session 6 转 VO
+    return null;
+}
+
+public User getLoginUser(HttpServletRequest request) {
+    // 1 取 session 2 判空 3 getById 4 判空
+    return null;
+}
+
+private String getEncryptPassword(String pwd) {
+    return DigestUtils.md5DigestAsHex((SALT + pwd).getBytes(StandardCharsets.UTF_8));
+}
+```
+
+**⑥ 顺序锁**
+
+1. **先校验、再查库**：脏参数不进 SQL。
+2. **先加密、再比对**：库里永远是密文，明文只存在于请求瞬间。
+3. **先写 session、再返回 VO**：否则前端拿到登录成功却调不了下一个接口。
+4. **登录失败统一话术**：不能区分"用户不存在"和"密码错误"，否则等于给撞库做用户枚举。
+5. **拦截器失败要抛异常**，不要 `return false` 静默；静默会让前端拿到空响应而不是 `40100`。
+
 ---
 
 # L2 · App CRUD（12 个文件）
@@ -1117,6 +1296,92 @@ public interface AppService extends IService<App> {
 | 分页上限与业务限制 | [mysql-index-and-redis-cache-deep-dive.md](./mysql-index-and-redis-cache-deep-dive.md) **11.4** |
 
 **⑥ 验收一句话**：用户 B 改用户 A 的应用，返回 `40101` 而不是"修改成功"。
+
+### 🔁 L2 代码流程骨架
+
+**① 新增**
+
+```text
+POST /api/app/add
+ → AppController.addApp(@RequestBody AppAddRequest dto, HttpServletRequest request)
+ → userService.getLoginUser(request)          // 未登录在这里就 40100
+ → AppService.createApp(dto, loginUser)
+     1 initPrompt 非空校验
+     2 组装 App：userId / initPrompt / appName
+     3 codeGenType 先写死 HTML（L6 再换成路由）
+     4 save
+ → ResultUtils.success(id)
+```
+
+**② 读详情**
+
+```text
+GET /api/app/get/vo?id=
+ → 判 id > 0
+ → getById(id) → null ? NOT_FOUND_ERROR
+ → getAppVO(app)
+     → BeanUtil.copyProperties(app, vo)
+     → userService.getById(app.getUserId())
+     → userService.getUserVO(user) → vo.setUserVO(...)
+ → success(vo)
+```
+
+**③ 修改 / 删除（属主校验的标准模板）**
+
+```text
+POST /api/app/update
+ → getLoginUser
+ → getById → null ? NOT_FOUND
+ → userId 不等 && 非管理员 ? NO_AUTH
+ → new App()，只 set 允许改的字段 + editTime
+ → updateById → false ? OPERATION_ERROR
+ → success(true)
+
+POST /api/app/delete
+ → getLoginUser → getById → 判空 → 属主或管理员
+ → removeById(id)          // 逻辑删除
+ → success(result)
+```
+
+**④ 我的列表**
+
+```text
+POST /api/app/my/list/page/vo
+ → getLoginUser
+ → pageSize > 20 ? PARAMS_ERROR
+ → dto.setUserId(loginUser.getId())        // ★ 后端强制覆盖
+ → getQueryWrapper(dto)
+ → page(Page.of(pageNum, pageSize), wrapper)
+ → getAppVOList(records) → 组装 Page<AppVO>
+```
+
+**⑤ 骨架代码**
+
+```java
+// AppServiceImpl：写操作统一"判存在 → 判属主 → 再动库"
+public Long createApp(AppAddRequest dto, User loginUser) {
+    // 1 校验 2 组装 3 save
+    return null;
+}
+
+public AppVO getAppVO(App app) {
+    AppVO vo = new AppVO();
+    BeanUtil.copyProperties(app, vo);
+    User user = userService.getById(app.getUserId());
+    if (user != null) {
+        vo.setUserVO(userService.getUserVO(user));
+    }
+    return vo;
+}
+```
+
+**⑥ 顺序锁**
+
+1. **先判存在、再判属主、最后写库**：顺序颠倒会把"无权限"报成"不存在"或反之，泄露资源是否存在。
+2. **更新只 set 白名单字段**：直接 `updateById(前端整个对象)` 会把 `userId`、`codeGenType` 一起改掉。
+3. **列表的 `userId` 由后端覆盖**：前端传的 `userId` 一律不信，否则就是水平越权。
+4. **写操作必须判断返回值**：`updateById` 返回 `false` 不抛异常，接口会假装成功。
+5. **读接口是否做属主校验是业务决定**：详情/预览可以公开，写操作必须校验（原项目 `/get/vo` 未做属主校验）。
 
 ---
 
@@ -1293,6 +1558,82 @@ public File generateAndSaveCode(String msg, CodeGenTypeEnum type, Long appId) {
 
 **⑥ 验收一句话**：给一句话，`tmp/code_output/html_{appId}/index.html` 出现在磁盘上，双击能打开，内容里**没有** markdown 围栏。
 
+### 🔁 L3 代码流程骨架
+
+**① 同步生成（先用一个临时接口跑通）**
+
+```text
+POST /api/app/generate
+ → getLoginUser
+ → AiCodeGeneratorFacade.generateAndSaveCode(message, HTML, appId)
+     1 codeGenType == null ? PARAMS_ERROR
+     2 factory.getAiCodeGeneratorService(appId, HTML)
+          → Caffeine 命中 → 直接返回实例
+          → 未命中 → 建 MessageWindowChatMemory + 回填历史 → AiServices.builder(...).build()
+     3 switch(HTML)
+          → service.generateHtmlCode(message)
+          → AiServices 动态代理：拼 prompt → 调模型 → 结构化输出 → HtmlCodeResult
+          → CodeFileSaverExecutor.executeSaver(result, HTML, appId)
+     4 default → BusinessException("不支持的生成类型")
+ → 返回 File
+```
+
+**② 落盘（模板方法内部）**
+
+```text
+saveCode(result, appId)
+ → validateInput(result)            // index.html 不能为空
+ → buildUniqueDir(appId)            // tmp/code_output/html_{appId}
+ → saveFiles(result, dir)           // 子类实现：真正写文件
+ → return new File(dir)
+```
+
+**③ 骨架代码**
+
+```java
+// 统一入口：类型分派 + 异常兜底
+public File generateAndSaveCode(String message, CodeGenTypeEnum type, Long appId) {
+    AiCodeGeneratorService service = factory.getAiCodeGeneratorService(appId, type);
+    return switch (type) {
+        case HTML -> {
+            HtmlCodeResult result = service.generateHtmlCode(message);
+            yield CodeFileSaverExecutor.executeSaver(result, type, appId);
+        }
+        case MULTI_FILE -> {
+            MultiFileCodeResult result = service.generateMultiFileCode(message);
+            yield CodeFileSaverExecutor.executeSaver(result, type, appId);
+        }
+        default -> throw new BusinessException(ErrorCode.SYSTEM_ERROR, "不支持的生成类型：" + type.getValue());
+    };
+}
+```
+
+```java
+// 文件保存模板：骨架 final，变体 abstract
+public abstract class CodeFileSaverTemplate<T> {
+
+    public final File saveCode(T result, Long appId) {
+        validateInput(result);
+        String baseDirPath = buildUniqueDir(appId);
+        saveFiles(result, baseDirPath);
+        return new File(baseDirPath);
+    }
+
+    protected abstract void validateInput(T result);
+    protected abstract void saveFiles(T result, String baseDirPath);
+    protected abstract String getCodeType();
+}
+```
+
+**④ 顺序锁**
+
+1. **先有 appId，再生成**：目录契约 `{codeType}_{appId}` 依赖它，不能临时造 ID。
+2. **先生成完整结果，再落盘**：流式路径也一样，落盘必须等 `doOnComplete`。
+3. **`saveCode` 必须是 `final`**：流程骨架锁死，子类只能改"写哪些文件"。
+4. **同步走结构化输出，流式才走解析器**：同步时 `AiServices` 已经把 JSON 转成 POJO；流式拿到的是纯文本，才需要 `CodeParser` 正则解析。
+5. **解析器正则和提示词是一份契约**：改一边必须改另一边，否则解析静默返回空字段。
+6. **switch 的 `default` 必须抛异常**：新增类型时编译器会提醒你补分支，而不是静默返回 null。
+
 ---
 
 # L4 · 流式输出 + 预览（6 个文件）
@@ -1416,6 +1757,87 @@ public Flux<ServerSentEvent<String>> chat(...) {
 | 虚拟线程为什么适合长连接 | 同上 **E7** |
 
 **⑥ 验收一句话**：`curl -N` 能看到逐段输出、最后有 `event: done`，浏览器打开静态地址能看到页面。
+
+### 🔁 L4 代码流程骨架
+
+**① 主线：Flux + SSE（原项目做法）**
+
+```text
+GET /api/app/chat/gen/code?appId=&message=
+ → AppController.chatToGenCode
+ → userService.getLoginUser(request)
+ → AppService.chatToGenCode(appId, message, loginUser)
+     1 校验 appId / message
+     2 getById → 判存在
+     3 属主校验（只能和自己的应用对话）
+     4 取 codeGenType 并转枚举
+     5 先落库 USER 消息            ★ 必须在调用 AI 之前
+     6 MonitorContextHolder.setContext(...)
+     7 facade.generateAndSaveCodeStream(...) → Flux<String>
+     8 streamHandlerExecutor.doExecute(...)
+          → SimpleTextStreamHandler.handle
+              map: builder.append(chunk)，同时放行给前端
+              doOnComplete: 解析 → 落盘 → 保存 AI 消息
+              doOnError: 保存错误消息
+          → doFinally: MonitorContextHolder.clearContext()
+ → controller.map(chunk -> ServerSentEvent.builder(chunk).build())
+ → 浏览器 EventSource 逐段收到 data:
+```
+
+**② 练习版：SseEmitter + 虚拟线程**
+
+```text
+Controller 创建 SseEmitter(timeout)
+ → Thread.startVirtualThread(() -> {
+       try {
+           stream.toIterable().forEach(chunk -> emitter.send(chunk));
+           emitter.complete();
+       } catch (Exception e) {
+           emitter.completeWithError(e);     // ★ 必须兜住，否则连接悬挂
+       }
+   });
+ → return emitter
+```
+
+**③ 骨架代码**
+
+```java
+@GetMapping(value = "/chat/gen/code", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux<ServerSentEvent<String>> chatToGenCode(@RequestParam Long appId,
+                                                   @RequestParam String message,
+                                                   HttpServletRequest request) {
+    User loginUser = userService.getLoginUser(request);
+    return appService.chatToGenCode(appId, message, loginUser)
+            .map(chunk -> ServerSentEvent.builder(chunk).build());
+}
+```
+
+```java
+// 流处理器骨架：只做三件事——收集、结束落盘、失败记录
+public Flux<String> handle(Flux<String> originFlux, ...) {
+    StringBuilder sb = new StringBuilder();
+    return originFlux
+            .map(chunk -> {
+                sb.append(chunk);
+                return chunk;
+            })
+            .doOnComplete(() -> {
+                // 解析 sb → 落盘 → 保存 AI 消息
+            })
+            .doOnError(e -> {
+                // 保存错误消息，不能让异常静默消失
+            });
+}
+```
+
+**④ 顺序锁**
+
+1. **用户消息先落库，再调 AI**：否则 AI 回复了但问题没存，历史只剩半截。
+2. **落盘必须在 `doOnComplete`**：`doOnNext` 拿到的是半截代码，写进去就是坏文件。
+3. **`doFinally` 清理 ThreadLocal**：成功、失败、取消三种结束都要清，否则线程复用会串上下文。
+4. **`doOnComplete` 里必须 try-catch**：那里的异常不会回到请求线程，用户只会看到流正常结束。
+5. **`SseEmitter` 必须 `complete()` / `completeWithError()`**：少一个，连接就一直挂着。
+6. **前端 `EventSource` 只能发 GET**：要传复杂参数就编码进 query 或用 POST + fetch stream。
 
 ---
 
@@ -1567,6 +1989,96 @@ chatHistoryService.loadChatHistoryToMemory(appId, memory, 20);
 
 **⑥ 验收一句话**：第一轮立了个标题，第二轮不提标题，模型仍然沿用第一轮的标题。
 
+### 🔁 L5 代码流程骨架
+
+**① 第一轮：建记忆 + 回填**
+
+```text
+POST /api/app/chat/gen/code（第一次）
+ → AppService.chatToGenCode
+ → facade.generateAndSaveCodeStream
+ → factory.getAiCodeGeneratorService(appId, type)
+     1 Caffeine 未命中 → createAiCodeGeneratorService
+     2 new MessageWindowChatMemory: id=appId, store=Redis, max=20
+     3 chatHistoryService.loadChatHistoryToMemory(appId, memory, 20)
+          → 查最近 20 条 → reversed() 成正序 → clear() → 逐条 add
+     4 AiServices.builder(...).chatMemory(memory).build()
+ → 调模型
+ → doOnComplete 保存 AI 消息到 chat_history
+```
+
+**② 第二轮：复用同一实例**
+
+```text
+第二次请求
+ → factory 的 Caffeine 命中 → 直接返回 AI 服务实例
+ → 不再查库、不再回填
+ → memory 里已经有第一轮的 USER / AI 消息
+ → 模型自然"记得"
+```
+
+**③ 查历史（游标分页）**
+
+```text
+GET /api/chatHistory/app/{appId}?pageSize=&lastCreateTime=
+ → ChatHistoryController.listAppChatHistory
+ → userService.getLoginUser
+ → ChatHistoryService.listAppChatHistoryByPage
+     1 校验 appId / pageSize(1~50) / 登录态
+     2 appService.getById → 判存在
+     3 属主或管理员校验
+     4 QueryWrapper: eq(appId) + lt(createTime, cursor)
+        + orderBy(createTime, desc) + limit(1, pageSize)
+     5 page(Page.of(1, pageSize), wrapper)
+ → Page<ChatHistory>
+```
+
+**④ 骨架代码**
+
+```java
+// 创建 AI 服务时的记忆装配
+MessageWindowChatMemory memory = MessageWindowChatMemory.builder()
+        .id(appId)                          // ★ 与应用维度对齐
+        .chatMemoryStore(redisChatMemoryStore)
+        .maxMessages(20)                    // ★ 必须等于回填条数
+        .build();
+
+chatHistoryService.loadChatHistoryToMemory(appId, memory, 20);
+
+return AiServices.builder(AiCodeGeneratorService.class)
+        .chatModel(chatModel)
+        .streamingChatModel(streamingChatModel)   // prototype，不能共享
+        .chatMemory(memory)
+        .build();
+```
+
+```java
+// 回填：查最近 N 条 → 反转 → 清空 → 逐条塞
+QueryWrapper wrapper = QueryWrapper.create()
+        .eq(ChatHistory::getAppId, appId)
+        .orderBy(ChatHistory::getCreateTime, false)
+        .limit(1, maxCount);
+
+List<ChatHistory> list = this.list(wrapper).reversed();
+chatMemory.clear();
+for (ChatHistory h : list) {
+    if (USER.equals(h.getMessageType())) {
+        chatMemory.add(UserMessage.from(h.getMessage()));
+    } else if (AI.equals(h.getMessageType())) {
+        chatMemory.add(AiMessage.from(h.getMessage()));
+    }
+}
+```
+
+**⑤ 顺序锁**
+
+1. **用户消息先落库，再调 AI**：记忆可以后补，事实不能丢。
+2. **先 `clear()` 再回填**：Redis 里可能已有旧窗口，不清会重复。
+3. **`memory.id` 与缓存键的 appId 对齐**：否则会读到别人的上下文。
+4. **`maxMessages` 与回填条数一致**：窗口 20、回填 30，多出的 10 条刚加载就被淘汰，白查库。
+5. **错误消息不要用 AI 类型存**：项目当前把"AI 回复失败"当 AI 消息写库，回填时会污染上下文——应单独类型并在回填时过滤。
+6. **同 appId 并发对话要隔离**：共享一个 memory 会上下文交错，至少加锁串行化。
+
 ---
 
 # L6 · 扩展（按需挂，每个独立验收）
@@ -1646,6 +2158,65 @@ L6 不建议按顺序全做，按"这个子模块在训练什么能力"来挑。
 
 **L6 的验收统一标准**：每个子模块单独跑通、单独验收，**一次只挂一个**。
 挂三个一起出问题，你无法判断是谁的错 —— 这是排障成本，不是能力问题。
+
+### 🔁 L6 各子模块流程骨架
+
+**① 八条链路总表**
+
+| 子模块 | 入口 | 关键调用链 | 终点 |
+|---|---|---|---|
+| 6.1 多文件 | `chat/gen/code`，type=MULTI_FILE | facade 分派 → `generateMultiFileCodeStream` → `processCodeStream` 的 `doOnComplete` → `CodeParserExecutor.parse` → `CodeFileSaverExecutor` → `MultiFileCodeFileSaverTemplate` | 3 个文件目录，`index.html` 必须有 |
+| 6.2 部署 | `POST /app/deploy` | Controller → `deployApp` → 校验 + 定位源码目录 → deployKey → `FileUtil.copyContent` 到 `code_deploy/{deployKey}` → 更新 app → 拼 URL → 异步截图 | 可访问 URL + cover |
+| 6.3 下载 | `GET /app/download/{appId}` | Controller → `getLoginUser` → 属主校验 → 取目录 → 设响应头 → `ZipUtil.zip(filter)` | ZIP 流 |
+| 6.4 限流 | 任意 `@RateLimit` 方法 | AOP `doBefore` → 生成 key → `getRateLimiter` → `expire(1h)` → `trySetRate` → `tryAcquire` | 放行或 `42900` |
+| 6.5 路由 | `POST /app/add` | `createApp` → `routingService.routeCodeGenType(prompt)` → 写 `app.codeGenType` | 类型枚举入库 |
+| 6.6 缓存监控 | 精选列表 / 每次 AI 调用 | `@Cacheable` → Redis 命中或回源；`MonitorContextHolder.set` → listener `onRequest` 存 attributes → `onResponse` 读取 → collector | 缓存 / 指标 |
+| 6.7 Vue 工程 | `chat/gen/code`，type=VUE_PROJECT | 推理模型 → `AiServices` + tools → `TokenStream` → `processTokenStream` → `JsonMessageStreamHandler` → `VueProjectBuilder` 构建 → 校验 dist | 可部署目录 |
+| 6.8 LangGraph4j | 独立入口 | 图启动 → 节点链 → 条件边 / 自环 → `recursionLimit` → 输出 | 试验产物，不进主链路 |
+
+**② 部署骨架**
+
+```java
+public String deployApp(Long appId, User loginUser) {
+    // 1 getById(appId) → null ? NOT_FOUND
+    // 2 属主校验 → NO_AUTH
+    // 3 sourceDir = tmp/code_output/{codeType}_{appId}
+    //    目录不存在 ? OPERATION_ERROR("请先生成代码")
+    // 4 deployKey：已有则复用；没有则 RandomUtil.randomString(6)
+    // 5 FileUtil.copyContent(sourceDir, new File(deployRoot + "/" + deployKey), true)
+    // 6 update app：deployKey + deployedTime
+    // 7 url = deployHost + "/" + deployKey + "/"
+    // 8 generateAppScreenshotAsync(appId, url)   // 异步，失败不影响部署
+    return url;
+}
+```
+
+**③ 限流骨架**
+
+```java
+@Around("@annotation(rateLimit)")
+public Object doAround(ProceedingJoinPoint point, RateLimit rateLimit) throws Throwable {
+    String key = generateRateLimitKey(point, rateLimit);     // 方法 + 用户/IP
+    RRateLimiter limiter = redissonClient.getRateLimiter(key);
+    limiter.expire(Duration.ofHours(1));                     // ★ 必须设过期
+    limiter.trySetRate(RateType.OVERALL,
+            rateLimit.rate(), rateLimit.rateInterval(), RateIntervalUnit.SECONDS);
+    if (!limiter.tryAcquire(1)) {
+        throw new BusinessException(ErrorCode.TOO_MANY_REQUEST);
+    }
+    return point.proceed();
+}
+```
+
+**④ 顺序锁**
+
+1. **部署前先确认源码目录存在**：否则复制的是空目录，返回的 URL 打开 404。
+2. **deployKey 复用**：每次重新随机会导致旧链接全部失效。
+3. **截图失败不能拖垮部署**：必须虚拟线程 + 内部 try-catch，异常只进日志。
+4. **限流 key 必须带用户/IP 维度 + 过期时间**：否则一个用户能拖垮全站，Redis 还会无限增长。
+5. **下载必须过滤 `node_modules` / `dist` / `.env`**：否则 ZIP 几个 G，还可能把密钥打进去。
+6. **Vue 构建后必须校验 `dist` 存在**：`npm build` 失败不抛异常时，返回值会被静默丢弃。
+7. **一次只挂一个子模块**：挂三个一起出问题，你无法定位是谁的错。
 
 ---
 
