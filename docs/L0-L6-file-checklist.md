@@ -2137,6 +2137,390 @@ for (ChatHistory h : list) {
 `langgraph4j/*` 整套
 > ★ 结论：不参与主链路，是技术试验田。学它的价值是"图编排"这个通用思路（条件边 + 自环重试 + 子图复用），不是复现代码。
 
+## 🔍 L6 各子模块详细讲解（6.1 ~ 6.8）
+
+> L6 不建议按顺序全做。下面每个子模块都按「解决什么问题 → 调用链 → 关键骨架 → 坑 → 验收」展开，挑你要做的那个看。
+
+### 6.1 多文件生成：模板方法的"扩展性考试"
+
+**解决什么问题**：让模型一次产出 `index.html` + `style.css` + `script.js` 三个文件，而不是把 CSS/JS 全塞进一个 HTML。
+
+**调用链**
+
+```text
+chat/gen/code (MULTI_FILE)
+ → service.generateMultiFileCodeStream
+ → processCodeStream 的 doOnComplete
+     1 拿到完整文本（含 ```html / ```css / ```javascript 围栏）
+     2 CodeParserExecutor.executeParser(text, MULTI_FILE)
+          → MultiFileCodeParser.parseCode
+     3 CodeFileSaverExecutor.executeSaver(result, MULTI_FILE, appId)
+          → MultiFileCodeFileSaverTemplate.saveCode
+     4 写 index.html / style.css / script.js
+```
+
+**解析骨架**
+
+```java
+public MultiFileCodeResult parseCode(String codeContent) {
+    String html = extractBlock(codeContent, "html");
+    String css  = extractBlock(codeContent, "css");
+    String js   = extractBlock(codeContent, "javascript|js");
+
+    // 只有 HTML 是硬性要求
+    ThrowUtils.throwIf(StrUtil.isBlank(html), ErrorCode.SYSTEM_ERROR, "HTML 代码为空");
+    return new MultiFileCodeResult(html, css, js);
+}
+```
+
+**落盘骨架**
+
+```java
+@Override
+protected void saveFiles(MultiFileCodeResult result, String baseDirPath) {
+    writeFile(baseDirPath, "index.html", result.getHtmlCode());
+    if (StrUtil.isNotBlank(result.getCssCode())) {
+        writeFile(baseDirPath, "style.css", result.getCssCode());
+    }
+    if (StrUtil.isNotBlank(result.getJsCode())) {
+        writeFile(baseDirPath, "script.js", result.getJsCode());
+    }
+}
+```
+
+**三个坑**
+
+| # | 坑 | 后果 |
+|---|---|---|
+| 1 | 正则语言标记与提示词不一致（提示词写 `js`、正则找 `javascript`） | 解析出空字段，页面没样式/没交互 |
+| 2 | CSS/JS 为空也报错 | 模型只生成了一个 HTML 时被误判为失败 |
+| 3 | 复用目录但不清理旧文件 | 上一版残留的 `script.js` 被新页面意外引用，行为诡异 |
+
+**验收**：`tmp/code_output/multi_file_{appId}/` 下有三个文件，`index.html` 用 `<link>` / `<script>` 正确引用另外两个，双击能打开且样式生效。
+
+---
+
+### 6.2 一键部署 + 封面
+
+**解决什么问题**：把生成目录变成固定 URL，并给应用生成一张展示封面。
+
+**调用链**
+
+```text
+POST /app/deploy
+ → getById → 判存在 → 属主校验
+ → sourceDir = tmp/code_output/{codeType}_{appId}
+ → VUE 特殊处理：npm build，改用 dist 目录
+ → deployKey = 已有则复用，否则随机 6 位
+ → 复制到 tmp/code_deploy/{deployKey}
+ → 更新 app.deployKey / deployedTime
+ → 拼 URL，异步截图并更新 cover
+```
+
+**骨架**
+
+```java
+public String deployApp(Long appId, User loginUser) {
+    // 1 判存在、判属主
+    // 2 定位源码目录，不存在 → "请先生成代码"
+    // 3 Vue：buildProject + 校验 dist
+    // 4 deployKey：StrUtil.isBlank ? RandomUtil.randomString(6) : 复用
+    // 5 FileUtil.copyContent(sourceDir, deployDir, true)
+    // 6 update app
+    // 7 generateAppScreenshotAsync(appId, url)
+    return url;
+}
+```
+
+**四个坑（本项目都真实存在）**
+
+| # | 坑 | 后果 |
+|---|---|---|
+| 1 | 截图异步用虚拟线程但**没有 try-catch** | 异常只进线程的未捕获处理器，用户看到部署成功、封面一直是空 |
+| 2 | `WebScreenshotUtils` 用**静态单例 WebDriver 且无锁** | 多用户同时部署会截到别人的页面 |
+| 3 | `@PreDestroy` 加在非 Spring Bean 上 | `webDriver.quit()` 永远不执行，Chrome 进程泄漏 |
+| 4 | 每次重新生成 deployKey | 旧链接全部失效；必须复用 |
+
+**另一个环境问题**：`deployHost` 在 dev 下默认 `http://localhost`（80 端口），本地没有 Nginx 挂载 `code_deploy`，所以返回的 URL 打不开。生产环境用 `code.deploy-host: http://<IP>/dist` 指向 Nginx。
+
+**验收**：连续部署两次 deployKey 不变；`tmp/code_deploy/{key}/index.html` 存在；若配置了 COS，`app.cover` 被更新。
+
+---
+
+### 6.3 代码下载
+
+**解决什么问题**：把生成目录打成 ZIP 下载，且不能把几十万个 `node_modules` 文件塞进去。
+
+**调用链**
+
+```text
+GET /app/download/{appId}
+ → getLoginUser
+ → 查 app → 判存在 → 属主校验
+ → 定位源码目录
+ → 设置响应头：Content-Type: application/zip
+              Content-Disposition: attachment; filename*=UTF-8''...
+ → ZipOutputStream 边读边写，跳过 node_modules / dist / .git / .env
+```
+
+**骨架**
+
+```java
+public void downloadProject(Long appId, HttpServletResponse response) {
+    // 1 校验 + 定位目录
+    // 2 response.setContentType("application/zip");
+    //    response.setHeader("Content-Disposition",
+    //        "attachment; filename*=UTF-8''" + URLEncoder.encode(name, UTF_8));
+    // 3 try (ZipOutputStream zos = new ZipOutputStream(response.getOutputStream())) {
+    //       遍历文件，过滤黑名单，逐个 putNextEntry + 拷贝
+    //   }
+}
+```
+
+**三个坑**
+
+| # | 坑 | 后果 |
+|---|---|---|
+| 1 | 用 `ZipUtil.zip(File)` 一次性打包 | 大目录内存/临时文件爆炸，甚至 OOM |
+| 2 | 文件名直接放进 `Content-Disposition` | 中文名乱码或响应头非法 |
+| 3 | 忘了过滤 `node_modules` / `dist` | ZIP 几个 G，下载超时 |
+
+**验收**：下载的 ZIP 解压后，`index.html` 在根目录，没有 `node_modules`，中文文件名正常。
+
+---
+
+### 6.4 分布式限流
+
+**解决什么问题**：多实例部署时，单机 `AtomicInteger` 限流等于没限——请求分散到不同实例，每个实例都以为"还没超"。
+
+**调用链**
+
+```text
+任意 @RateLimit 方法
+ → RateLimitAspect 环绕
+ → key = rate_limit:{方法}:{USER|IP}:{userId|ip}
+ → Redisson RRateLimiter
+ → expire(1 小时)
+ → trySetRate(OVERALL, rate, interval, SECONDS)   // 幂等
+ → tryAcquire(1) 失败 → 抛 TOO_MANY_REQUEST
+ → 放行 point.proceed()
+```
+
+**骨架**
+
+```java
+@Around("@annotation(rateLimit)")
+public Object doAround(ProceedingJoinPoint point, RateLimit rateLimit) throws Throwable {
+    String key = buildKey(point, rateLimit);
+    RRateLimiter limiter = redissonClient.getRateLimiter(key);
+    limiter.expire(Duration.ofHours(1));
+    limiter.trySetRate(RateType.OVERALL,
+            rateLimit.rate(), rateLimit.rateInterval(), RateIntervalUnit.SECONDS);
+    if (!limiter.tryAcquire(1)) {
+        throw new BusinessException(ErrorCode.TOO_MANY_REQUEST);
+    }
+    return point.proceed();
+}
+```
+
+**四个坑**
+
+| # | 坑 | 后果 |
+|---|---|---|
+| 1 | key 不带用户/IP | 一个人把所有用户的名额吃光 |
+| 2 | key 不带方法名 | 不同接口互相抢配额 |
+| 3 | 不设 `expire` | Redis 里的限流 key 无限增长 |
+| 4 | 同类内部调用 `this.method()` | AOP 代理不生效，限流形同虚设 |
+
+**验收**：`rate=5 / 60s` 时，并发 6 次请求，第 6 次返回 `42900`；换一个用户能继续访问。
+
+---
+
+### 6.5 生成类型路由
+
+**解决什么问题**：用户只说一句需求，系统自动判断该生成单 HTML、多文件还是 Vue 工程。
+
+**调用链**
+
+```text
+POST /app/add
+ → createApp
+ → routingFactory.createAiCodeGenTypeRoutingService()
+ → routeCodeGenType(initPrompt)
+      → AiServices 动态代理 → qwen-turbo
+      → 结构化输出：返回 HTML / MULTI_FILE / VUE_PROJECT
+ → app.codeGenType = 结果
+ → save
+```
+
+**骨架**
+
+```java
+public interface AiCodeGenTypeRoutingService {
+    @SystemMessage(fromResource = "prompt/codegen-routing-system-prompt.txt")
+    CodeGenTypeEnum routeCodeGenType(@UserMessage String userPrompt);
+}
+```
+
+```yaml
+# 分类模型配置：便宜、快、输出短
+model: qwen-turbo
+max-tokens: 100
+temperature: 0.1
+```
+
+**三个坑**
+
+| # | 坑 | 后果 |
+|---|---|---|
+| 1 | 用主模型做分类 | 每次建应用都多花一次大模型调用 |
+| 2 | 分类结果不校验 | 模型返回无法映射的值时 `getValue()` 可能 NPE |
+| 3 | 没有兜底 | 分类服务超时会导致整个"创建应用"失败 |
+
+建议：`routeCodeGenType` 外层 try-catch，失败默认 `HTML`，保证建应用这条主链路不被分类拖垮。
+
+**验收**：三种典型 prompt 分别路由到三种类型，并在 `app.codeGenType` 里看到对应值。
+
+---
+
+### 6.6 缓存 / 监控
+
+**缓存部分**
+
+```text
+GET /app/good/list/page/vo
+ → @Cacheable(cacheNames = "good_app_page",
+              key = "T(utils.CacheKeyUtils).getGoodAppKey(#pageSize, #pageNum)",
+              condition = "#pageSize <= 10")
+ → Redis 命中 → 直接返回
+ → 未命中 → 查库 → 写 Redis（默认 30 分钟，good_app_page 5 分钟）
+```
+
+三个要注意的点：
+
+1. **`condition` 只缓存前 10 页**：深分页缓存命中率低，纯占内存。
+2. **`RedisCacheManagerConfig` 里 value 序列化器被注释掉了**：默认走 JDK 序列化，缓存对象必须 `Serializable`；类结构一变，旧缓存反序列化直接失败。
+3. **缓存 key 必须带页码和页大小**，否则第一页会覆盖第二页。
+
+**监控部分**
+
+```text
+请求进入
+ → MonitorContextHolder.setContext(new MonitorContext(userId, appId))
+ → 调模型
+ → ChatModelListener.onRequest：取 ThreadLocal，塞进 requestContext.attributes()
+ → onResponse：从 attributes 取（跨线程安全）
+ → onError：却又从 ThreadLocal 取   ★ 线程不同，可能 null
+ → doFinally: clearContext()
+```
+
+**两个真实隐患**：
+
+| # | 隐患 | 后果 |
+|---|---|---|
+| 1 | `onError` 用 ThreadLocal 而非 attributes | 模型 SDK 回调线程不同 → `getContext()` 返回 null → NPE，错误指标丢失 |
+| 2 | `onRequest` 没判空 | 非 Web 线程（定时任务/异步）调用模型时直接 NPE |
+
+**验收**：同一接口连续调两次，第二次 SQL 日志不出现；模型调用后 metrics 有 request/success/token 记录。
+
+---
+
+### 6.7 Vue 工程生成（第二轮再做）
+
+**解决什么问题**：让模型像程序员一样"建目录、写文件、改文件、删文件、构建项目"，而不是吐一大段文本。
+
+**文件分工**
+
+| 文件 | 作用 |
+|---|---|
+| `BaseTool` / `ToolManager` | 工具基类 + 注册表 |
+| `FileWriteTool` / `FileReadTool` / `FileModifyTool` / `FileDeleteTool` / `FileDirReadTool` | 模型可调用的文件操作 |
+| `ExitTool` | 让模型主动结束 |
+| `AiResponseMessage` / `ToolRequestMessage` / `ToolExecutedMessage` / `StreamMessage` | SSE JSON 协议 |
+| `JsonMessageStreamHandler` | 解析协议、生成展示文案、过滤重复工具请求 |
+| `VueProjectBuilder` | `npm install` + `npm run build` + 校验 `dist` |
+| `ReasoningStreamingChatModelConfig` | 推理模型配置 |
+
+**调用链**
+
+```text
+TokenStream
+ → onPartialResponse        → {"type":"ai_response", ...}
+ → onPartialToolExecutionRequest → {"type":"tool_request", ...}
+ → onToolExecuted           → {"type":"tool_executed", ...}
+ → onCompleteResponse       → buildProject（同步）→ sink.complete()
+ → JsonMessageStreamHandler 解析 → 前端展示 / 存历史
+```
+
+**四个坑**
+
+| # | 坑 | 后果 |
+|---|---|---|
+| 1 | 用 `Flux<String>` 纯文本接口 | 丢掉工具调用事件，前端看不到"正在写哪个文件" |
+| 2 | 工具名幻觉不兜底 | `toolManager.getTool(name)` 返回 null → NPE |
+| 3 | 构建不检查 `dist` | 构建失败但接口返回成功，预览 404 |
+| 4 | 构建放在 `sink.complete()` 之前同步执行 | 前端几十秒收不到结束信号；构建异常可能让流悬挂 |
+
+**验收**：`vue_project_{appId}` 下有 `src/` 和 `dist/`，`dist/index.html` 能打开；SSE 日志里三种消息类型都出现过。
+
+---
+
+### 6.8 LangGraph4j（建议最后或跳过）
+
+**定位**：不参与主链路，是"图编排"的技术试验田。37 个文件分三类：
+
+| 分类 | 内容 |
+|---|---|
+| 入门 demo | `SimpleGraphApp` / `GreeterNode` / `SimpleWorkflowApp` / `SimpleStatefulWorkflowApp` |
+| 三条工作流 | `CodeGenWorkflow` / `CodeGenSubgraphWorkflow` / `CodeGenConcurrentWorkflow` |
+| 图片收集案例 | 6 个普通节点 + 6 个并发节点 + 4 个工具 + 3 个模型 + 3 个 Service |
+
+**图片收集流程（最完整的一条）**
+
+```text
+ImagePlanNode（拆解需要哪些图）
+ → 并发：Logo / Illustration / Diagram / ContentImage 四个 Collector
+ → ImageAggregatorNode（汇总去重）
+ → CodeQualityCheckNode（检查）
+ → 不通过 → 条件边回到生成节点（自环重试）
+ → ProjectBuilderNode（组装最终产物）
+```
+
+**四个必须理解的概念**
+
+| 概念 | 在本项目里的体现 |
+|---|---|
+| 状态（State） | `MessagesState` 内部的 Map，各节点原地修改 |
+| 节点（Node） | 一个 `AsyncNodeAction`，相当于一个工位 |
+| 条件边 | 质量检查不通过 → 回到生成节点，形成重试回路 |
+| 递归上限 | 重试回路必须配 `recursionLimit`，否则无限自环烧额度 |
+
+**三个坑**
+
+1. **没有递归上限**：模型一直不合格就一直重试，LLM 额度被刷爆。
+2. **并发节点写同一字段**：四个 Collector 如果都写 `images`，结果不确定；必须各写各的字段，最后聚合。
+3. **外部工具的硬编码配置会失效**（如第三方站点的 buildId）：上游一变就静默失败，必须做可用性校验和降级。
+
+**验收**：先跑 `SimpleWorkflowApp` 看懂节点顺序，再跑 `CodeGenWorkflow` 一次，能说清"条件边在什么情况下回到哪个节点"。
+
+---
+
+### L6 八个子模块的推荐顺序
+
+```text
+6.1 多文件（扩模板方法）
+ → 6.5 类型路由（决定用哪种生成）
+ → 6.2 部署 + 封面（产物可访问）
+ → 6.3 下载（产物可带走）
+ → 6.4 限流（保护 LLM 额度）
+ → 6.6 缓存 / 监控（性能与可观测）
+ → 6.7 Vue（能力升级，第二轮）
+ → 6.8 LangGraph（技术试验，可跳过）
+```
+
+**除了 6.7 / 6.8，前六个都是"半天能挂一个"的体量。**
+判断标准始终是那一句：**不做它，系统会在什么场景下出问题？**
+
 ### 🧠 L6 默想卡（每个子模块只有 3 个核心问题）
 
 L6 不建议按顺序全做，按"这个子模块在训练什么能力"来挑。
@@ -2387,3 +2771,192 @@ public Object doAround(ProceedingJoinPoint point, RateLimit rateLimit) throws Th
 
 **★ 通过标准全部是"能解释为什么"，不是"能背出代码"。**
 因为面试官考的是判断力，不是记忆力；工作中真正有用的也是判断力。
+
+---
+
+# 附录 A · `core/handler`：流式响应的后处理层
+
+> 对应源码：`src/main/java/com/yupi/yuaicodemother/core/handler/`
+> - `StreamHandlerExecutor.java`（分派器）
+> - `SimpleTextStreamHandler.java`（HTML / 多文件）
+> - `JsonMessageStreamHandler.java`（Vue 工程）
+
+## A.0 先厘清三个概念（不然看不懂为什么一个 `new`、一个注入）
+
+### 1）"有依赖"看的是**字段**，不是"是不是类"
+
+| 类 | 字段 | 需要外部提供吗 |
+|---|---|---|
+| `SimpleTextStreamHandler` | **一个字段都没有** | 不需要 |
+| `JsonMessageStreamHandler` | `@Resource private ToolManager toolManager;` | **需要**，否则 `toolManager == null` |
+
+"依赖"在 Spring 语境里 = **这个类要正常工作，必须有人把某个对象塞进它的字段/构造参数**。
+`SimpleTextStreamHandler` 的所有数据都来自方法参数（`originFlux`、`chatHistoryService`、`appId`、`loginUser`）和方法内局部变量（`StringBuilder`），所以它没有依赖。
+
+### 2）默认构造器**不解决**依赖
+
+每个类在没有显式构造器时，编译器会送一个空的无参构造器。它只做两件事：
+
+1. 调用 `super()`
+2. 把字段设成默认值（对象是 `null`，int 是 `0`）
+
+它**不会**帮你创建 `ToolManager`。所以：
+
+```java
+JsonMessageStreamHandler handler = new JsonMessageStreamHandler();
+handler.handle(...);   // 编译通过，运行到工具请求分支时 toolManager.getTool(...) → NPE
+```
+
+Spring 的 `@Resource` 是容器在对象创建**之后**通过反射塞进去的；你 `new` 出来的对象，容器根本不知道，也就不会塞。
+
+### 3）`new X().handle()` 不是"类.方法"，是"对象.方法"
+
+Java 里只有**静态方法**能用 `类名.方法名()` 调用：
+
+```java
+SimpleTextStreamHandler.handle(...);        // ✗ 编译错误：handle 不是静态方法
+SimpleTextStreamHandler.hi();               // ✓ 仅当 hi() 是 static
+new SimpleTextStreamHandler().handle(...);  // ✓ 先创建对象，再在对象上调用
+```
+
+`new SimpleTextStreamHandler().handle(...)` 的求值顺序是：
+
+```text
+① new SimpleTextStreamHandler()   → 产生一个对象
+② 对象.handle(...)                → 在这个对象上调用实例方法
+```
+
+它看起来"像类名开头"，只是因为 `new` 后面紧跟着类名。**真正决定能不能用 `类名.` 的是 `static`，和这个写法无关。**
+
+### 4）那为什么 `SimpleTextStreamHandler` 不写成静态方法？
+
+可以写成静态，但没必要，而且会失去三点好处：
+
+1. **可替换**：Handler 是策略模式的一环，将来 VUE 以外可能再加一种格式；实例方法天然支持接口/子类替换，静态方法做不到。
+2. **可注入**：哪天它需要 `ToolManager` 或配置，加个字段 + `@Component` 就行，调用方不用改签名。
+3. **成本可忽略**：`new` 一个空对象只是一次 TLAB 指针碰撞，JIT 还可能直接栈上分配，纳秒级。
+
+`ResultUtils` / `ThrowUtils` 才是"纯工具类"：私有构造器 + 全静态方法，因为它们永远不需要被替换，也不持有任何东西。
+
+## A.1 三个文件的分工
+
+| 文件 | 角色 | 状态 | 为什么这样创建 |
+|---|---|---|---|
+| `StreamHandlerExecutor` | 按 `codeGenType` 分派 | 单例 Bean | 需要持有 `JsonMessageStreamHandler` 字段 |
+| `SimpleTextStreamHandler` | HTML / MULTI_FILE 的旁路收集 | 无状态 | 零字段，直接 `new` |
+| `JsonMessageStreamHandler` | VUE 的 JSON 协议解析 | 无状态 | 依赖 `ToolManager`，必须是 Bean |
+
+分派逻辑：
+
+```java
+return switch (codeGenType) {
+    case VUE_PROJECT ->
+            jsonMessageStreamHandler.handle(originFlux, chatHistoryService, appId, loginUser);
+    case HTML, MULTI_FILE ->
+            new SimpleTextStreamHandler().handle(originFlux, chatHistoryService, appId, loginUser);
+};
+```
+
+这里**没有 `default`**：`switch` 表达式对枚举要求穷尽，将来新增类型会编译失败，逼你补分支——比运行时抛异常安全。
+
+## A.2 一个分片从模型到前端
+
+```text
+AppServiceImpl.chatToGenCode
+ ├─ 保存 USER 消息
+ ├─ MonitorContextHolder.set
+ ├─ facade.generateAndSaveCodeStream
+ │    ├─ HTML/MULTI：Flux<String> → processCodeStream
+ │    │      doOnNext 收集 → doOnComplete 解析 + 落盘
+ │    └─ VUE：TokenStream → processTokenStream（包装成 JSON）
+ └─ streamHandlerExecutor.doExecute
+        ├─ HTML/MULTI → SimpleTextStreamHandler：再收集 → 存 AI 消息
+        └─ VUE       → JsonMessageStreamHandler：解析 → 过滤 → 存 AI 消息
+```
+
+**两个 `doOnComplete` 职责不同**：
+
+| 位置 | 负责 | 失败后果 |
+|---|---|---|
+| `AiCodeGeneratorFacade.processCodeStream` | 解析 + **写磁盘** | `catch` 后只 `log.error`，前端仍然收到完整流 |
+| 两个 Handler | **写数据库**（AI 消息） | 异常抛给 Reactor，流以 error 结束 |
+
+## A.3 `SimpleTextStreamHandler`
+
+```java
+public Flux<String> handle(Flux<String> originFlux, ChatHistoryService chatHistoryService,
+                           long appId, User loginUser) {
+    StringBuilder aiResponseBuilder = new StringBuilder();   // 方法内局部变量
+    return originFlux
+            .map(chunk -> {
+                aiResponseBuilder.append(chunk);              // 旁路收集
+                return chunk;                                 // 原样放行
+            })
+            .doOnComplete(() -> {                              // 正常结束才入库
+                chatHistoryService.addChatMessage(appId, aiResponseBuilder.toString(),
+                        ChatHistoryMessageTypeEnum.AI.getValue(), loginUser.getId());
+            })
+            .doOnError(error -> {                              // 失败也记一笔
+                chatHistoryService.addChatMessage(appId,
+                        "AI回复失败: " + error.getMessage(),
+                        ChatHistoryMessageTypeEnum.AI.getValue(), loginUser.getId());
+            });
+}
+```
+
+要点：
+
+1. `StringBuilder` 是**局部变量**，所以单例/多例都安全，不需要加锁。
+2. `map` 只旁路收集，返回原 `chunk`，前端看到的和模型输出一致。
+3. **不落盘**：落盘需要 `codeGenType`、`CodeFileSaverExecutor`，那些在 Facade 层。
+
+## A.4 `JsonMessageStreamHandler`
+
+Vue 用推理模型 + 工具调用，分片是 JSON 协议：
+
+```json
+{"type":"ai_response","data":"我先创建项目结构..."}
+{"type":"tool_request","id":"call_1","name":"writeFile","arguments":"{\"path\":\"src/App.vue\"}"}
+{"type":"tool_executed","id":"call_1","name":"writeFile","arguments":"{...}","result":"写入成功"}
+```
+
+三个分支：
+
+| 分支 | 做什么 | 为什么 |
+|---|---|---|
+| `AI_RESPONSE` | 拼进历史，原样返回 | 只存"人话"，不存协议外壳 |
+| `TOOL_REQUEST` | 用 `seenToolIds` 去重后返回展示文案 | 工具参数是分片回调的，同一条会来很多次 |
+| `TOOL_EXECUTED` | 解析参数 → 生成结果文案 → **拼进历史** | 下一轮模型需要知道自己写过什么 |
+
+收尾的 `.filter(StrUtil::isNotEmpty)`：重复请求和未知类型返回 `""`，不过滤就会给前端发空 `data:`。
+
+## A.5 两条链路对比
+
+| 维度 | SimpleText | Json |
+|---|---|---|
+| 类型 | HTML / MULTI_FILE | VUE_PROJECT |
+| 分片 | 原始代码文本 | JSON 协议 |
+| 前端 | 当文本渲染 | 按 `type` 分流 |
+| 历史 | 完整原始输出（含围栏） | 自然语言 + 工具结果 |
+| 落盘 | Facade `doOnComplete` | Facade `onCompleteResponse` |
+| 实例 | 每次 `new` | 单例注入 |
+
+## A.6 8 个真实瑕疵
+
+| # | 位置 | 问题 | 后果 |
+|---|---|---|---|
+| 1 | `JsonMessageStreamHandler` 的 `switch (typeEnum)` | `getEnumByValue` 返回 `null` 时，switch 直接 NPE | `default` 永远走不到 |
+| 2 | `SimpleTextStreamHandler.doOnError` | 用 `AI` 类型存错误 | 下一轮回填把"AI回复失败"当成自己说过的话 |
+| 3 | 同上 | 错误带原始异常 message | 内网 IP / SQL 片段进入历史 |
+| 4 | `AiCodeGeneratorFacade.processCodeStream` | 落盘失败只 `log.error` | 前端以为成功，磁盘没有文件 |
+| 5 | 两条链路 | 同一内容存两个 `StringBuilder` | 大文件内存翻倍 |
+| 6 | `JsonMessageStreamHandler` 的 `JSONUtil.parseObj(arguments)` | 假定参数一定是 JSON 对象 | 无参工具会抛异常 |
+| 7 | `toolManager.getTool(name)` | 未知工具名返回 `null` | NPE |
+| 8 | `processTokenStream.onCompleteResponse` | 先同步 `buildProject` 再 `sink.complete()` | 构建几十秒前端无响应；构建抛异常可能流悬挂 |
+
+## A.7 面试怎么问
+
+1. "流式接口为什么不能边收边写文件？" → 分片是半截代码，必须等 `doOnComplete` 拿完整内容再解析落盘。
+2. "`doOnComplete` 里抛异常，前端收得到吗？" → 收不到，Reactor 默认静默丢弃，必须自己 try-catch + 记日志。
+3. "为什么两个 Handler 一个 `new` 一个注入？" → 看字段：零字段可 `new`，有 `@Resource` 依赖必须交给容器。
+4. "工具调用为什么要去重？" → 参数是分片回调，同一个 `toolCallId` 会触发多次，直接展示会刷屏。
