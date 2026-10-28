@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Python 知识图谱 · 交互版</title>
+<style>
+  :root{
+    --bg:#0b101b; --bg2:#111827; --panel:#121a2b; --line:#1f2a3f;
+    --fg:#e6ecf7; --muted:#7d8aa3; --accent:#4f8cff; --accent2:#7fb0ff; --ok:#3ddc97;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--fg);
+    font:14px/1.6 "Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+    display:grid; grid-template-columns:230px 1fr; height:100vh; overflow:hidden;
+  }
+  aside{
+    background:var(--bg2); border-right:1px solid var(--line);
+    display:flex; flex-direction:column; min-height:0;
+  }
+  .brand{padding:16px 16px 10px;font-weight:700;font-size:15px;letter-spacing:.4px}
+  .brand small{display:block;font-weight:400;color:var(--muted);font-size:11px;margin-top:3px}
+  nav{flex:1;overflow-y:auto;padding:6px}
+  nav button{
+    display:block;width:100%;text-align:left;padding:9px 12px;margin-bottom:3px;
+    background:none;border:1px solid transparent;border-radius:8px;color:var(--fg);
+    cursor:pointer;font:inherit;font-size:13px;
+  }
+  nav button:hover{background:#16203a}
+  nav button.on{background:#16203a;border-color:#27406b;color:var(--accent2)}
+  nav button .n{color:var(--muted);font-size:11px;margin-right:6px}
+
+  main{display:flex;flex-direction:column;min-width:0}
+  .bar{
+    display:flex;align-items:center;gap:8px;padding:10px 16px;
+    border-bottom:1px solid var(--line);background:var(--bg2);flex-wrap:wrap;
+  }
+  .bar h2{margin:0;font-size:15px;font-weight:600;flex:1;min-width:180px}
+  .bar button{
+    padding:5px 11px;border-radius:8px;border:1px solid var(--line);
+    background:#0d1421;color:var(--fg);cursor:pointer;font:inherit;font-size:12px;
+  }
+  .bar button:hover{border-color:var(--accent);color:var(--accent2)}
+  .hintbar{font-size:11px;color:var(--muted);padding:6px 16px;border-bottom:1px solid var(--line)}
+  #wrap{flex:1;overflow:hidden;position:relative;cursor:grab}
+  #wrap.grabbing{cursor:grabbing}
+  #canvas{
+    position:absolute;left:0;top:0;transform-origin:0 0;
+    padding:24px;
+  }
+  #canvas svg{max-width:none !important;height:auto}
+  .loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted)}
+  .tip{position:absolute;right:14px;bottom:12px;font-size:11px;color:#55627a}
+</style>
+</head>
+<body>
+
+<aside>
+  <div class="brand">Python 知识图谱<small>拖拽平移 · 滚轮缩放 · 点击左侧切换</small></div>
+  <nav id="nav"></nav>
+</aside>
+
+<main>
+  <div class="bar">
+    <h2 id="title">总览</h2>
+    <button id="zin">放大 +</button>
+    <button id="zout">缩小 −</button>
+    <button id="fit">适应宽度</button>
+    <button id="reset">重置视图</button>
+  </div>
+  <div class="hintbar" id="hint">提示：这块图是「总览」，先建立全局感，再往细节钻。</div>
+  <div id="wrap">
+    <div id="canvas"></div>
+    <div class="loading" id="loading">渲染中…</div>
+  </div>
+  <div class="tip">离线可用 · 数据都在本地</div>
+</main>
+
+<script src="./mermaid.min.js"></script>
+<script>
+const DIAGRAMS = [
+  {
+    id: "overview",
+    title: "① 总览脑图",
+    hint: "提示：这张图是全局地图。先记住 9 个一级分支，细节后面逐个看。",
+    code: `mindmap
+  root((Python))
+    语言基础
+      变量与类型
+      运算符
+      分支与循环
+      列表
+      元组
+      字符串
+      集合
+      字典
+      函数
+      面向对象
+    数据处理
+      文件读写
+      异常处理
+      JSON与CSV
+      Excel与Word
+      正则表达式
+    语言进阶
+      推导式
+      迭代器与生成器
+      装饰器
+      上下文管理器
+      并发编程
+    数据库
+      SQL四类语句
+      索引与优化
+      连接MySQL
+    应用开发
+      Django路由与视图
+      ORM模型
+      模板
+      RESTful与DRF
+      缓存与异步任务
+      部署上线
+    数据采集
+      requests
+      解析库
+      动态渲染
+      Scrapy
+    数据分析
+      NumPy
+      pandas
+      可视化
+    机器学习
+      分类
+      回归
+      聚类
+      评估与调参
+    工程化
+      虚拟环境
+      依赖管理
+      Git
+      Docker
+      测试与日志`
+  },
+  {
+    id: "deps",
+    title: "② 依赖路径（先学什么）",
+    hint: "读法：箭头 = 必须先掌握。容器和函数是全图的两个枢纽。",
+    code: `flowchart TD
+    A["变量 · 类型 · 运算符"] --> B["分支 · 循环"]
+    B --> C["容器 list/tuple/str/set/dict"]
+    C --> D["函数"]
+    C --> E["字符串处理"]
+    D --> F["面向对象"]
+    D --> G["装饰器 / 闭包 / 生成器"]
+    E --> H["正则表达式"]
+    C --> I["文件读写"]
+    I --> J["异常处理"]
+    J --> K["JSON / CSV / Excel"]
+    G --> L["并发编程"]
+    F --> M["数据库 ORM"]
+    M --> N["Web 开发 Django"]
+    H --> O["爬虫"]
+    K --> P["数据分析 pandas"]
+    P --> Q["可视化"]
+    P --> R["机器学习"]
+    L --> O
+    N --> S["工程化与部署"]
+    R --> S
+    Q --> S`
+  },
+  {
+    id: "containers",
+    title: "③ 四大容器",
+    hint: "要顺序用 list，去重用 set，映射用 dict，做键用 tuple。",
+    code: `flowchart LR
+    subgraph M["可变"]
+        L["list 有序可重复 O_n"]
+        S["set 无序不重复 O_1"]
+        D["dict 键唯一 O_1"]
+    end
+    subgraph I["不可变"]
+        T["tuple 可哈希 可做键"]
+        ST["str 不可变 切片返回新对象"]
+    end
+    L -->|去重| S
+    S -->|映射| D
+    L -->|固定结构| T
+    D -->|序列化| T`
+  },
+  {
+    id: "functions",
+    title: "④ 函数进阶",
+    hint: "这条线是从「会用」到「会写」的分水岭。",
+    code: `flowchart TD
+    P["参数顺序：位置 默认 *args 仅关键字 **kwargs"] --> S["作用域 LEGB"]
+    S --> C["闭包：内层记住外层变量"]
+    C --> D["装饰器 = 闭包 + 函数作参数"]
+    D --> G["生成器：yield 惰性产出"]
+    G --> I["迭代协议 __iter__ __next__"]
+    I --> CM["上下文管理器 __enter__ __exit__"]`
+  },
+  {
+    id: "oop",
+    title: "⑤ 面向对象",
+    hint: "is-a 用继承，has-a 用组合；组合优先。",
+    code: `flowchart TD
+    O["class 类"] --> A["实例属性 self.x"]
+    O --> B["类属性 共享"]
+    O --> C["方法 实例/classmethod/staticmethod"]
+    O --> D["继承 + super"]
+    O --> E["魔术方法 __init__ __repr__ __len__ __eq__"]
+    E --> F["@property 方法伪装成属性"]
+    D --> G["is-a 继承 / has-a 组合 优先组合"]`
+  },
+  {
+    id: "data",
+    title: "⑥ 数据处理链",
+    hint: "记住这条链，pandas 的 API 不用背——按链条找函数。",
+    code: `flowchart LR
+    R["原始文件 CSV/Excel/JSON/DB"] --> L["加载 read_*"]
+    L --> Q["查看 head/info/describe"]
+    Q --> C["清洗 缺失/重复/类型"]
+    C --> T["转换 新增列/合并/分组"]
+    T --> A["分析 groupby/agg/pivot"]
+    A --> V["可视化 matplotlib"]
+    V --> O["导出 Excel/报告/图"]`
+  },
+  {
+    id: "django",
+    title: "⑦ Django 请求生命周期",
+    hint: "面试高频：一条请求从浏览器到数据库再回到浏览器。",
+    code: `sequenceDiagram
+    participant B as 浏览器
+    participant U as urls.py
+    participant V as views.py
+    participant M as models.py
+    participant DB as 数据库
+    participant T as 模板/序列化器
+    B->>U: HTTP 请求
+    U->>V: 匹配视图
+    V->>M: 查询或写入
+    M->>DB: SQL
+    DB-->>M: 结果集
+    M-->>V: 模型对象
+    V->>T: 渲染/序列化
+    T-->>B: HTTP 响应`
+  },
+  {
+    id: "concurrency",
+    title: "⑧ 并发模型决策",
+    hint: "口诀：IO 密集用协程/线程，CPU 密集用多进程。",
+    code: `flowchart TD
+    Q{"任务类型"} -->|IO 等待多| IO{"并发量"}
+    Q -->|纯 CPU 计算| CPU["multiprocessing 绕过 GIL"]
+    IO -->|几千连接| AS["asyncio 协程"]
+    IO -->|几十任务| TH["threading 线程"]
+    CPU --> OK1["真正并行"]
+    AS --> OK2["单线程高并发"]
+    TH --> OK3["等待期间切换"]`
+  },
+  {
+    id: "ml",
+    title: "⑨ 机器学习流程",
+    hint: "特征工程比换模型更能提分；过拟合就回头看数据。",
+    code: `flowchart LR
+    A["取数"] --> B["清洗"]
+    B --> C["特征工程"]
+    C --> D["划分训练/测试"]
+    D --> E["训练"]
+    E --> F["评估"]
+    F -->|欠拟合| C
+    F -->|过拟合| G["正则化/剪枝/更多数据"]
+    F -->|达标| H["上线"]
+    G --> E`
+  },
+  {
+    id: "layers",
+    title: "⑩ 分层关系",
+    hint: "容器和函数出度最高——最该下苦功的地方。",
+    code: `flowchart TB
+    subgraph L1["语言底座"]
+        C1["容器"]
+        C2["函数"]
+        C3["面向对象"]
+    end
+    subgraph L2["数据层"]
+        D1["文件/CSV/JSON"]
+        D2["pandas/NumPy"]
+        D3["数据库 SQL"]
+    end
+    subgraph L3["应用层"]
+        A1["Django Web"]
+        A2["爬虫"]
+    end
+    subgraph L4["算法层"]
+        M1["机器学习"]
+    end
+    subgraph L5["工程层"]
+        E1["并发"]
+        E2["Docker/部署"]
+        E3["测试/日志"]
+    end
+    C1 --> D1
+    C2 --> D2
+    C3 --> A1
+    C2 --> A2
+    D1 --> D2
+    D3 --> A1
+    D2 --> M1
+    A2 --> D1
+    E1 --> A2
+    A1 --> E2
+    M1 --> E2
+    E3 --> E2`
+  }
+];
+
+const canvas = document.getElementById("canvas");
+const wrap = document.getElementById("wrap");
+const loading = document.getElementById("loading");
+let scale = 1, tx = 0, ty = 0, current = null;
+
+mermaid.initialize({
+  startOnLoad: false,
+  theme: "dark",
+  securityLevel: "loose",
+  flowchart: { curve: "basis", useMaxWidth: false, htmlLabels: true },
+  mindmap: { useMaxWidth: false },
+  sequence: { useMaxWidth: false },
+  themeVariables: {
+    background: "#0b101b",
+    primaryColor: "#16203a",
+    primaryTextColor: "#e6ecf7",
+    primaryBorderColor: "#2b4270",
+    lineColor: "#4f8cff",
+    secondaryColor: "#1b2740",
+    tertiaryColor: "#131c2e",
+    fontSize: "15px"
+  }
+});
+
+function applyTransform() {
+  canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+}
+
+async function show(idx) {
+  current = idx;
+  const d = DIAGRAMS[idx];
+  document.getElementById("title").textContent = d.title;
+  document.getElementById("hint").textContent = d.hint;
+  [...document.querySelectorAll("nav button")].forEach((b, i) =>
+    b.classList.toggle("on", i === idx));
+  loading.style.display = "flex";
+  canvas.innerHTML = "";
+  try {
+    const { svg } = await mermaid.render("g" + idx + "_" + Date.now(), d.code);
+    canvas.innerHTML = svg;
+    const el = canvas.querySelector("svg");
+    if (el) { el.style.maxWidth = "none"; el.style.height = "auto"; }
+    scale = 1; tx = 0; ty = 0; applyTransform();
+    requestAnimationFrame(fitWidth);
+  } catch (err) {
+    canvas.innerHTML = `<pre style="color:#ef5d6b;white-space:pre-wrap">渲染失败：${err}</pre>`;
+  }
+  loading.style.display = "none";
+}
+
+function fitWidth() {
+  const svg = canvas.querySelector("svg");
+  if (!svg) return;
+  const w = svg.getBoundingClientRect().width / (scale || 1);
+  const avail = wrap.clientWidth - 48;
+  scale = Math.min(1.2, Math.max(0.15, avail / w));
+  tx = 0; ty = 0;
+  applyTransform();
+}
+
+document.getElementById("zin").onclick = () => { scale *= 1.2; applyTransform(); };
+document.getElementById("zout").onclick = () => { scale /= 1.2; applyTransform(); };
+document.getElementById("fit").onclick = fitWidth;
+document.getElementById("reset").onclick = () => { scale = 1; tx = 0; ty = 0; applyTransform(); };
+
+let dragging = false, sx = 0, sy = 0;
+wrap.addEventListener("mousedown", (e) => {
+  dragging = true; sx = e.clientX - tx; sy = e.clientY - ty;
+  wrap.classList.add("grabbing");
+});
+window.addEventListener("mouseup", () => { dragging = false; wrap.classList.remove("grabbing"); });
+window.addEventListener("mousemove", (e) => {
+  if (!dragging) return;
+  tx = e.clientX - sx; ty = e.clientY - sy; applyTransform();
+});
+wrap.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const k = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+  const rect = wrap.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  tx = mx - (mx - tx) * k;
+  ty = my - (my - ty) * k;
+  scale *= k;
+  applyTransform();
+}, { passive: false });
+window.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowRight") show(Math.min(DIAGRAMS.length - 1, current + 1));
+  if (e.key === "ArrowLeft") show(Math.max(0, current - 1));
+});
+
+const nav = document.getElementById("nav");
+DIAGRAMS.forEach((d, i) => {
+  const b = document.createElement("button");
+  b.innerHTML = `<span class="n">${String(i + 1).padStart(2, "0")}</span>${d.title.replace(/^[①-⑩]\s*/, "")}`;
+  b.onclick = () => show(i);
+  nav.appendChild(b);
+});
+
+show(0);
+</script>
+</body>
+</html>
